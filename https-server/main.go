@@ -35,6 +35,7 @@ import (
 	"github.com/gorilla/mux"
 
 	"net/http/pprof"
+	zmq "github.com/pebbe/zmq4"
 )
 
 //== Constants ==//
@@ -55,8 +56,95 @@ var generated_files_timezone = os.Getenv("GENERATED_FILE_TIMEZONE")
 
 var unzipped_template = ""
 
-var scenario_data [][]string
-var scenario_data_idx = 0
+type record struct {
+	eId string
+	cId string
+	datarate string
+}
+
+// testbed data are in format:
+// "eid1,cid1,datarate1,eid2,cid2,datarate2,...,eidN,cidN,datarateN,"
+func parseTestbedData(s string) []record {
+	var records []record
+	split := strings.Split(s, ",")
+	if (len(split) - 1) % 3 != 0 {
+		log.Error("Data incomplete");
+		return records
+	}
+	for i := 0; i < len(split) -1; i = i+3 {
+		r := record{split[i], split[i+1], split[i+2]}
+		records = append(records, r)
+	}
+	return records
+}
+
+func getTestbedData() string {
+	report_header := "datarate_report"
+	zmq_address := "tcp://127.0.0.1:6671"
+
+	subscriber, _ := zmq.NewSocket(zmq.SUB)
+	defer subscriber.Close()
+	subscriber.Connect(zmq_address)
+	subscriber.SetSubscribe(report_header)
+
+	log.Info("ZMQ subscriber created and connected")
+
+	reply, err := subscriber.RecvMessage(zmq.DONTWAIT)
+	if err != nil {
+		// may consider better error handling
+		log.Error("Receiving ZMQ message failed")
+		return ""
+	}
+	if len(reply) > 0 {
+		return string(reply[0])
+	}
+	return ""
+}
+
+// maps cell_id to [cell_max, cell_prev]
+var data = make(map[string][]int)
+
+// takes cellIds and returns PRB usage for them
+// PRB Usage calculated as current_datarate/max_datarate for a given cell
+func getPrbUsage(cell_ids []string) []string {
+	testbed_data := getTestbedData()
+	// update cache with current data
+	if testbed_data != "" {
+		records := parseTestbedData(testbed_data)
+		for _, r := range records {
+			current_datarate, err := strconv.Atoi(r.datarate)
+			if err != nil {
+				log.Error("Error converting datarate to number: ", r.datarate)
+				continue
+			}
+			_, ok := data[r.cId]
+			if ok == false {
+				data[r.cId] = make([]int, 2)
+				data[r.cId][0] = current_datarate
+			} else {
+				if data[r.cId][0] < current_datarate {
+					data[r.cId][0] = current_datarate
+				}
+			}
+			data[r.cId][1] = current_datarate
+		}
+	}
+	// get data for requested cells
+	prbs := make([]string, len(cell_ids))
+	for i, cell_id := range cell_ids {
+		prb := "0"
+		cell_data, ok := data[cell_id]
+		if ok == true {
+			if cell_data[0] == 0 {
+				prb = "0"
+			} else {
+				prb = strconv.Itoa(cell_data[1] * 100 / cell_data[0])
+			}
+		}
+		prbs[i] = prb
+	}
+	return prbs
+}
 
 // Get static file
 // Returned file is based on configuration
@@ -258,29 +346,6 @@ func scenario(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// load scenario data on a first execution
-	if len(scenario_data) == 0 {
-
-		fn := scenario_files + "/" + scenario_data_file
-		f, err := os.Open(fn)
-		if err != nil {
-			log.Fatal("Unable to read input file " + fn, err)
-		}
-		defer f.Close()
-
-		csvReader := csv.NewReader(f)
-		_, err = csvReader.Read() // discard first line
-		if err != nil {
-			log.Fatal("Unable to parse file as CSV for " + fn, err)
-			return
-		}
-		scenario_data, err = csvReader.ReadAll()
-		if err != nil {
-			log.Fatal("Unable to parse file as CSV for " + fn, err)
-			return
-		}
-	}
-
 	vars := mux.Vars(req)
 
 	if id, ok := vars["fileid"]; ok {
@@ -334,13 +399,11 @@ func scenario(w http.ResponseWriter, req *http.Request) {
 		tend := tcur.Add(d)
 		endtime := tend.Format("2006-01-02T15:04:05") + timezone
 
-		//get counter values from scenario file - pmDlPrbUsage
-		ctr_value_1 := scenario_data[scenario_data_idx][0]
-		ctr_value_2 := scenario_data[scenario_data_idx][1]
-		scenario_data_idx++;
-		if scenario_data_idx >= len(scenario_data) {
-			scenario_data_idx = 0
-		}
+		//get counter values from testbed's zmq
+		prb_data := getPrbUsage([]string{"14550001", "1454c001"})
+		log.Info("PRBUsage data:", prb_data)
+		ctr_value_1 := prb_data[0]
+		ctr_value_2 := prb_data[1]
 
 		//get counter values from ransim  - pmRrcConnectedUes
 		//dummy values for now
